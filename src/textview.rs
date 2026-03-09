@@ -369,6 +369,78 @@ pub struct TextView {
 }
 
 impl TextView {
+    fn try_auto_heading(&self) -> bool {
+        if !self.is_editable() {
+            return false;
+        }
+        let buffer = &self.buffer;
+        let cursor = buffer.get_insert_iter();
+        let mut line_start = cursor.clone();
+        line_start.set_line_offset(0);
+        let prefix = buffer.text(&line_start, &cursor, false);
+        let prefix = prefix.as_str();
+        let level = prefix.chars().take_while(|c| *c == '#').count();
+        if level == 0 || level > 6 || prefix.len() != level {
+            return false;
+        }
+        let format = match level {
+            1 => ParFormat::H1,
+            2 => ParFormat::H2,
+            3 => ParFormat::H3,
+            4 => ParFormat::H4,
+            5 => ParFormat::H5,
+            6 => ParFormat::H6,
+            _ => return false,
+        };
+        let tag_name = Tag::from_par_format(&format);
+        let tag = buffer.tag_table().lookup(tag_name).unwrap();
+        buffer.begin_user_action();
+        let mut ls = line_start.clone();
+        let mut cur = cursor.clone();
+        buffer.delete(&mut ls, &mut cur);
+        let mut pos = buffer.get_insert_iter();
+        buffer.insert(&mut pos, " ");
+        let tag_end = buffer.get_insert_iter();
+        let mut tag_start = tag_end.clone();
+        tag_start.backward_char();
+        let mut tline_end = tag_start.clone();
+        tline_end.forward_line();
+        buffer.apply_tag(&tag, &tag_start, &tline_end);
+        buffer.end_user_action();
+        true
+    }
+    fn paste_image(&self) -> bool {
+        let clipboard = self.textview.clipboard();
+
+        if let Some(texture) = clipboard.content() {}
+
+        let this = self.clone();
+        clipboard.read_texture_async(None::<&gtk::gio::Cancellable>, move |result| {
+            if let Ok(Some(texture)) = result {
+                this.save_and_insert_image(texture);
+            }
+        });
+
+        false
+    }
+
+    fn save_and_insert_image(&self, texture: gdk::Texture) {
+        let filename = format!(
+            "image_{}.png",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        );
+        let path = format!("/tmp/{}", filename);
+
+        if texture.save_to_png(&path) {
+            let buffer = &self.buffer;
+            let mut cursor = buffer.get_insert_iter();
+            let pos_start = cursor.offset();
+
+            buffer.insert_paintable(&mut cursor, &texture);
+
+            buffer.apply_image_offset(&cursor, &path, "", pos_start);
+        }
+    }
     pub fn new() -> Self {
         let ui_src = include_str!("textview.ui");
         let b = gtk::Builder::new();
@@ -496,9 +568,19 @@ impl TextView {
         let mut start = iter.clone();
         start.backward_chars(count);
         self.tags.for_each_edit_tag(|tag: &gtk::TextTag| buffer.apply_tag(tag, iter, &start));
+
+        let mut line_start = iter.clone();
+        line_start.set_line_offset(0);
+        for tag in line_start.tags() {
+            let name = tag.get_name();
+            if matches!(name.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6") {
+                buffer.apply_tag(&tag, &start, iter);
+                break;
+            }
+        }
+
         None
     }
-
     fn get_key_press_handler(&self) -> EventControllerKey {
         let controller = EventControllerKey::new();
         controller.connect_key_pressed({
@@ -523,6 +605,12 @@ impl TextView {
                         keys::l => this.edit_link(),
                         keys::n => this.apply_text_clear(),
                         keys::t => this.char_format(CharFormat::Mono),
+                        keys::v => {
+                            if this.paste_image() {
+                                return Inhibit(true);
+                            }
+                            return Inhibit(false);
+                        }
                         keys::y => this.redo(),
                         keys::z => {
                             if (modifier & gdk::ModifierType::SHIFT_MASK).is_empty() {
@@ -557,6 +645,12 @@ impl TextView {
                         keys::Tab | keys::ISO_Left_Tab => this.insert_tab(),
                         keys::KP_Enter | keys::Return => {
                             this.tags.text_edit(TextEdit::NewLine);
+                            return Inhibit(false);
+                        }
+                        keys::space => {
+                            if this.try_auto_heading() {
+                                return Inhibit(true);
+                            }
                             return Inhibit(false);
                         }
                         _ => return Inhibit(false),
