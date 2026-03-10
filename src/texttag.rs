@@ -30,6 +30,7 @@ pub enum ParFormat {
 
 pub struct Tag {}
 impl Tag {
+    pub const CHECKBOX_START: &str = "CHECKBOX:";
     pub const LIST_UL: &'static str = "list_ul";
     pub const LIST_OL: &'static str = "list_ol";
     pub const LIST_UL_PREFIX: &'static str = "list_ul_prefix";
@@ -104,6 +105,7 @@ pub trait TextTagExt2 {
     fn get_link(&self) -> Option<String>;
 
     fn get_par_format(&self) -> Option<ParFormat>;
+    fn get_checkbox(&self) -> Option<bool>;
 }
 
 impl TextTagExt2 for gtk::TextTag {
@@ -141,6 +143,14 @@ impl TextTagExt2 for gtk::TextTag {
             Tag::H6 => Some(ParFormat::H6),
             Tag::CODE => Some(ParFormat::Code),
             _ => None,
+        }
+    }
+    fn get_checkbox(&self) -> Option<bool> {
+        let name = self.get_name();
+        if name.starts_with(Tag::CHECKBOX_START) {
+            Some(&name[Tag::CHECKBOX_START.len()..] == "1")
+        } else {
+            None
         }
     }
 }

@@ -392,6 +392,7 @@ pub struct TextView {
 pub enum AnchorKind {
     Image(String),
     Rule,
+    Checkbox,
 }
 
 #[derive(Clone)]
@@ -518,6 +519,96 @@ impl TextView {
         this
     }
 
+    fn create_checkbox_widget(&self, anchor: &gtk::TextChildAnchor, checked: bool) -> gtk::Widget {
+        let checked_cell = Rc::new(RefCell::new(checked));
+        let icon = gtk::Image::from_icon_name(if checked {
+            Some("checkbox-checked-symbolic")
+        } else {
+            Some("checkbox-symbolic")
+        });
+        icon.set_pixel_size(16);
+        icon.set_valign(gtk::Align::Center);
+        icon.set_margin_start(2);
+        icon.set_margin_end(6);
+        icon.set_can_focus(false);
+        icon.set_focusable(false);
+        icon.set_cursor_from_name(Some("default"));
+
+        let gesture = gtk::GestureClick::new();
+        gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
+        gesture.connect_pressed({
+            let (icon, checked_cell, buffer, anchor) =
+                (icon.clone(), checked_cell.clone(), self.buffer.clone(), anchor.clone());
+            move |g, _, _, _| {
+                let new_checked = !*checked_cell.borrow();
+                *checked_cell.borrow_mut() = new_checked;
+                icon.set_from_icon_name(if new_checked {
+                    Some("checkbox-checked-symbolic")
+                } else {
+                    Some("checkbox-symbolic")
+                });
+                let iter = buffer.iter_at_child_anchor(&anchor);
+                let mut tag_end = iter.clone();
+                tag_end.forward_char();
+                buffer.remove_tag(&buffer.create_checkbox_tag(!new_checked), &iter, &tag_end);
+                buffer.apply_tag(&buffer.create_checkbox_tag(new_checked), &iter, &tag_end);
+                let mut line_end = tag_end.clone();
+                if !line_end.ends_line() {
+                    line_end.forward_to_line_end();
+                }
+                let strike = buffer.tag_table().lookup(Tag::STRIKE).unwrap();
+                if new_checked {
+                    buffer.apply_tag(&strike, &tag_end, &line_end);
+                } else {
+                    buffer.remove_tag(&strike, &tag_end, &line_end);
+                }
+                g.set_state(gtk::EventSequenceState::Claimed);
+            }
+        });
+        icon.add_controller(&gesture);
+        icon.upcast::<gtk::Widget>()
+    }
+    fn try_auto_checkbox(&self) -> bool {
+        if !self.is_editable() {
+            return false;
+        }
+        let buffer = &self.buffer;
+        let cursor = buffer.get_insert_iter();
+        let mut line_start = cursor.clone();
+        line_start.set_line_offset(0);
+        let typed = buffer.text(&line_start, &cursor, false);
+        if typed.as_str() != "[]" {
+            return false;
+        }
+
+        buffer.begin_user_action();
+        let mut ls = line_start.clone();
+        let mut cur = cursor.clone();
+        buffer.delete(&mut ls, &mut cur);
+
+        let mut pos = buffer.get_insert_iter();
+        let anchor = buffer.create_child_anchor(&mut pos);
+
+        // Tag the anchor char so to_markdown() can serialise it
+        let tag = buffer.create_checkbox_tag(false);
+        let anchor_start = buffer.iter_at_offset(pos.offset() - 1);
+        buffer.apply_tag(&tag, &anchor_start, &pos);
+
+        let widget = self.create_checkbox_widget(&anchor, false);
+        self.textview.add_child_at_anchor(&widget, &anchor);
+
+        self.anchor_registry.borrow_mut().push(AnchorEntry {
+            anchor,
+            kind: AnchorKind::Checkbox,
+            last_offset: pos.offset(),
+        });
+
+        // Insert a space after so the cursor is ready to type the label
+        buffer.insert(&mut pos, " ");
+        buffer.end_user_action();
+        true
+    }
+
     fn restore_anchors(&self) {
         let buffer = &self.buffer;
 
@@ -547,7 +638,6 @@ impl TextView {
                 let mut pos = buffer.iter_at_offset(start.offset());
                 let anchor = buffer.create_child_anchor(&mut pos);
 
-                // Try cache first, then load from disk
                 let texture_opt = {
                     let store = self.image_widgets.borrow();
                     store.get(&path).map(|(t, w, h)| (t.clone(), *w, *h))
@@ -564,7 +654,6 @@ impl TextView {
                     let widget = self.create_resizable_image(&texture, &path, w, h);
                     self.textview.add_child_at_anchor(&widget, &anchor);
 
-                    // Re-apply image tag over the new anchor char
                     let anchor_start = pos.offset() - 1;
                     buffer.apply_image_offset(&pos, &path, "", anchor_start);
 
@@ -614,6 +703,64 @@ impl TextView {
             }
         }
 
+        {
+            let mut offset = 0;
+            loop {
+                let iter = buffer.iter_at_offset(offset);
+                if iter.offset() >= buffer.end_iter().offset() {
+                    break;
+                }
+
+                // Skip chars that are already live anchors
+                if iter.child_anchor().is_some() {
+                    offset += 1;
+                    continue;
+                }
+
+                let checkbox_info = iter
+                    .tags()
+                    .into_iter()
+                    .find_map(|t| t.get_checkbox().map(|checked| (checked, t)));
+
+                if let Some((checked, tag)) = checkbox_info {
+                    let mut start = iter.clone();
+                    if !start.starts_tag(Some(&tag)) {
+                        start.backward_to_tag_toggle(Some(&tag));
+                    }
+                    let mut end = start.clone();
+                    end.forward_to_tag_toggle(Some(&tag));
+
+                    buffer.begin_irreversible_action();
+                    buffer.delete(&mut start, &mut end);
+                    let mut pos = buffer.iter_at_offset(start.offset());
+                    let anchor = buffer.create_child_anchor(&mut pos);
+
+                    // Re-apply the checkbox tag over the new anchor char
+                    let new_tag = buffer.create_checkbox_tag(checked);
+                    let anchor_start = buffer.iter_at_offset(pos.offset() - 1);
+                    buffer.apply_tag(&new_tag, &anchor_start, &pos);
+
+                    let widget = self.create_checkbox_widget(&anchor, checked);
+                    self.textview.add_child_at_anchor(&widget, &anchor);
+
+                    self.anchor_registry.borrow_mut().push(AnchorEntry {
+                        anchor,
+                        kind: AnchorKind::Checkbox,
+                        last_offset: pos.offset(),
+                    });
+                    buffer.end_irreversible_action();
+
+                    offset = pos.offset();
+                } else {
+                    offset += 1;
+                }
+            }
+        }
+
+        // After undo/redo, live anchor widgets are destroyed but the \u{FFFC}
+        // placeholder chars remain. We match them to registry entries whose
+        // anchor.is_deleted() == true and recreate the widgets.
+
         let mut orphan_offsets: Vec<i32> = Vec::new();
         let mut iter = buffer.start_iter();
         loop {
@@ -635,21 +782,22 @@ impl TextView {
         orphaned_entries.sort_by_key(|e| e.last_offset);
         drop(registry);
 
-        for (i, &offset) in orphan_offsets.iter().enumerate() {
+        for (i, &orphan_offset) in orphan_offsets.iter().enumerate() {
             let entry = match orphaned_entries.get(i) {
                 Some(e) => e.clone(),
                 None => break,
             };
 
-            let mut pos = buffer.iter_at_offset(offset);
+            let mut pos = buffer.iter_at_offset(orphan_offset);
             let mut end = pos.clone();
             end.forward_char();
 
             buffer.begin_irreversible_action();
             buffer.delete(&mut pos, &mut end);
-            let mut ins = buffer.iter_at_offset(offset);
+            let mut ins = buffer.iter_at_offset(orphan_offset);
             let new_anchor = buffer.create_child_anchor(&mut ins);
 
+            // Recreate the correct widget based on what kind of anchor this was
             let widget = match &entry.kind {
                 AnchorKind::Image(path) => {
                     let store = self.image_widgets.borrow();
@@ -665,17 +813,29 @@ impl TextView {
                     }
                 }
                 AnchorKind::Rule => self.create_rule_widget(),
+                AnchorKind::Checkbox => {
+                    // Try to read checked state from the tag still on the orphan
+                    // char; if the tag is gone too, default to unchecked.
+                    let checked = buffer
+                        .get_checkbox_at_iter(&buffer.iter_at_offset(orphan_offset))
+                        .map(|(c, _)| c)
+                        .unwrap_or(false);
+                    self.create_checkbox_widget(&new_anchor, checked)
+                }
             };
 
             self.textview.add_child_at_anchor(&widget, &new_anchor);
 
+            // Update the registry entry to point to the new live anchor
             let mut registry = self.anchor_registry.borrow_mut();
             if let Some(reg_entry) = registry.iter_mut().find(|e| {
-                matches!(&e.kind, AnchorKind::Image(p)
-                if matches!(&entry.kind, AnchorKind::Image(ep) if p == ep))
-                    || (matches!(e.kind, AnchorKind::Rule)
-                        && matches!(entry.kind, AnchorKind::Rule)
-                        && e.anchor.is_deleted())
+                e.anchor.is_deleted()
+                    && match (&e.kind, &entry.kind) {
+                        (AnchorKind::Image(a), AnchorKind::Image(b)) => a == b,
+                        (AnchorKind::Rule, AnchorKind::Rule) => true,
+                        (AnchorKind::Checkbox, AnchorKind::Checkbox) => true,
+                        _ => false,
+                    }
             }) {
                 reg_entry.anchor = new_anchor;
             }
@@ -1009,6 +1169,7 @@ impl TextView {
         buffer.end_user_action();
         true
     }
+
     fn try_list_continue(&self) -> bool {
         if !self.is_editable() {
             return false;
@@ -1022,6 +1183,53 @@ impl TextView {
 
         let mut line_start = cursor.clone();
         line_start.set_line_offset(0);
+
+        // ── Checkbox continuation ─────────────────────────────────────────────
+        if line_start.char() == '\u{FFFC}' {
+            if let Some((_checked, _tag)) = buffer.get_checkbox_at_iter(&line_start) {
+                // content starts after the FFFC anchor char and the space
+                let mut content_start = line_start.clone();
+                content_start.forward_chars(2);
+                let content = buffer.text(&content_start, &cursor, false);
+
+                if content.trim().is_empty() {
+                    // empty checkbox line — delete the whole line and exit list
+                    buffer.begin_user_action();
+                    let mut ls = line_start.clone();
+                    let mut cur = cursor.clone();
+                    buffer.delete(&mut ls, &mut cur);
+                    buffer.end_user_action();
+                    return true;
+                } else {
+                    // non-empty — insert a new unchecked checkbox on next line
+                    buffer.begin_user_action();
+                    let mut pos = cursor.clone();
+                    buffer.insert(&mut pos, "\n");
+
+                    let mut insert_pos = buffer.get_insert_iter();
+                    let anchor = buffer.create_child_anchor(&mut insert_pos);
+
+                    let tag = buffer.create_checkbox_tag(false);
+                    let anchor_char_start = buffer.iter_at_offset(insert_pos.offset() - 1);
+                    buffer.apply_tag(&tag, &anchor_char_start, &insert_pos);
+
+                    let widget = self.create_checkbox_widget(&anchor, false);
+                    self.textview.add_child_at_anchor(&widget, &anchor);
+
+                    self.anchor_registry.borrow_mut().push(AnchorEntry {
+                        anchor,
+                        kind: AnchorKind::Checkbox,
+                        last_offset: insert_pos.offset(),
+                    });
+
+                    buffer.insert(&mut insert_pos, " ");
+                    buffer.end_user_action();
+                    return true;
+                }
+            }
+        }
+
+        // ── existing ul/ol list continuation ─────────────────────────────────
         let line_text = buffer.text(&line_start, &cursor, false);
         let line = line_text.as_str();
 
@@ -1061,14 +1269,12 @@ impl TextView {
                 return true;
             }
 
-            // save current line number before mutation
             let current_line = cursor.line();
 
             buffer.begin_user_action();
             let mut pos = cursor.clone();
             buffer.insert(&mut pos, &format!("\n{}", prefix));
 
-            // new line is current_line + 1 - fetch everything fresh by line number
             let new_line = current_line + 1;
             let new_bol = match buffer.iter_at_line(new_line) {
                 Some(i) => i,
@@ -1082,12 +1288,10 @@ impl TextView {
                 new_eol.forward_to_line_end();
             }
 
-            // margin tag on whole new line
             let line_tag =
                 buffer.tag_table().lookup(if is_ol { Tag::LIST_OL } else { Tag::LIST_UL }).unwrap();
             buffer.apply_tag(&line_tag, &new_bol, &new_eol);
 
-            // grey color on prefix only - fresh iterators again
             let new_bol2 = match buffer.iter_at_line(new_line) {
                 Some(i) => i,
                 None => {
@@ -1110,7 +1314,6 @@ impl TextView {
 
         false
     }
-
     fn calculate_image_display_size(texture: &gdk::Texture, available_width: i32) -> (i32, i32) {
         let nat_w = texture.width();
         let nat_h = texture.height();
@@ -1279,6 +1482,7 @@ impl TextView {
 
         None
     }
+
     fn copy_anchor(&self) -> bool {
         let buffer = &self.buffer;
         if let Some((start, end)) = buffer.selection_bounds() {
@@ -1347,6 +1551,9 @@ impl TextView {
                     buffer.insert(&mut pos, "\n");
                     buffer.end_user_action();
                     return true;
+                }
+                AnchorKind::Checkbox => {
+                    // do nothing here since checkboxes don't live in the clipboard
                 }
             }
         }
@@ -1443,6 +1650,10 @@ impl TextView {
                             return Inhibit(false);
                         }
                         keys::space => {
+                            if this.try_auto_checkbox() {
+                                return Inhibit(true);
+                            }
+
                             if this.try_auto_heading() {
                                 return Inhibit(true);
                             }

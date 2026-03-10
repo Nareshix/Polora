@@ -16,6 +16,8 @@ const ESCAPES_EVERYWHERE: [char; 2] = ['`', '_'];
 const ESCAPES_ONLY_IN_BLOCK: [char; 1] = ['*'];
 
 pub trait TextBufferMd {
+    fn convert_checkboxes(&self, pos_start: i32);
+
     fn to_markdown(&self) -> String;
     fn insert_markdown(&self, iter: &mut gtk::TextIter, markdown: &str);
 
@@ -29,6 +31,26 @@ pub trait TextBufferMd {
 }
 
 impl TextBufferMd for gtk::TextBuffer {
+    fn convert_checkboxes(&self, pos_start: i32) {
+        for (pattern, checked) in &[("[ ]", false), ("[x]", true), ("[X]", true)] {
+            let mut offset = pos_start;
+            loop {
+                let start_iter = self.iter_at_offset(offset);
+                if let Some((start, end)) =
+                    start_iter.forward_search(pattern, gtk::TextSearchFlags::VISIBLE_ONLY, None)
+                {
+                    let insert_offset = start.offset();
+                    let tag = self.create_checkbox_tag(*checked);
+                    // Tag the raw text — restore_anchors will swap it for a widget
+                    self.apply_tag(&tag, &start, &end);
+                    offset = end.offset();
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
     fn to_markdown(&self) -> String {
         // add newline at end if needed
         let mut end = self.end_iter();
@@ -192,7 +214,12 @@ impl TextBufferMd for gtk::TextBuffer {
             }
             if c == '\u{FFFC}' {
                 if !has_image {
-                    s += "---";
+                    let checkbox = it.tags().iter().find_map(|t| t.get_checkbox());
+                    if let Some(checked) = checkbox {
+                        s += if checked { "[x]" } else { "[ ]" };
+                    } else {
+                        s += "---";
+                    }
                 }
                 // Image anchor: skip the char, the ![ and ](path) tags handle it
                 it.forward_char();
@@ -412,6 +439,7 @@ impl TextBufferMd for gtk::TextBuffer {
         self.convert_colors(Tag::RED, pos_start);
         self.convert_colors(Tag::BLUE, pos_start);
         self.convert_colors(Tag::YELLOW, pos_start);
+        self.convert_checkboxes(pos_start);
     }
 
     fn assign_markup(&self, markup: &str) -> &gtk::TextBuffer {

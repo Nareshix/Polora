@@ -28,6 +28,9 @@ pub fn get_file_name(link: &str) -> String {
 pub trait TextBufferExt2 {
     fn clear(&self);
 
+    fn create_checkbox_tag(&self, checked: bool) -> gtk::TextTag;
+    fn get_checkbox_at_iter(&self, iter: &gtk::TextIter) -> Option<(bool, gtk::TextTag)>;
+
     // Current word for cursor at start or in word, NOT at the end.
     fn get_current_word_bounds(&self) -> Option<(TextIter, TextIter)>;
     fn get_current_tag_bounds(&self, tag: &gtk::TextTag) -> Option<(TextIter, TextIter)>;
@@ -274,5 +277,29 @@ impl TextBufferExt2 for gtk::TextBuffer {
         } else {
             self.place_cursor(&cursor);
         }
+    }
+    fn create_checkbox_tag(&self, checked: bool) -> gtk::TextTag {
+        let name =
+            format!("{}{}", crate::texttag::Tag::CHECKBOX_START, if checked { "1" } else { "0" });
+        let table = &self.tag_table();
+        if let Some(tag) = table.lookup(&name) {
+            tag
+        } else {
+            TextTagTable::create_tag(&name, table)
+        }
+    }
+
+    fn get_checkbox_at_iter(&self, iter: &gtk::TextIter) -> Option<(bool, gtk::TextTag)> {
+        for tag in iter.tags() {
+            if let Some(checked) = tag.get_checkbox() {
+                return Some((checked, tag));
+            }
+        }
+        for tag in iter.toggled_tags(false) {
+            if let Some(checked) = tag.get_checkbox() {
+                return Some((checked, tag));
+            }
+        }
+        None
     }
 }
