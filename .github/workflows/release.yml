@@ -18,7 +18,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: marko-linux
-          path: target/release/marko-editor
+          path: target/release/Polora
 
   build-mac:
     runs-on: macos-latest
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: marko-mac
-          path: target/release/marko-editor
+          path: target/release/Polora
 
   build-windows:
     runs-on: windows-latest
@@ -47,7 +47,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: marko-windows
-          path: target/release/marko-editor.exe
+          path: target/release/Polora.exe
 
   publish:
     needs: [build-linux, build-mac, build-windows]
@@ -59,6 +59,6 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            artifacts/marko-linux/marko-editor
-            artifacts/marko-mac/marko-editor
-            artifacts/marko-windows/marko-editor.exe
+            artifacts/marko-linux/Polora
+            artifacts/marko-mac/Polora
+            artifacts/marko-windows/Polora.exe
