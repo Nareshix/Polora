@@ -7,7 +7,7 @@ edition = "2024"
 default = ["x11", "gdk4-x11"]
 
 [dependencies]
-reqwest = { version = "0.11.*", features = ["blocking"] }
+reqwest = { version = "0.12.*", features = ["blocking"] }
 configparser = "2.0.*"
 x11 = { version = "2.18.*", optional = true }
 anyhow = "1.0.*"
@@ -33,3 +33,4 @@ package = "gdk4"
 version = "0.*"
 package = "gdk4-x11"
 optional = true
+
