@@ -383,10 +383,127 @@ pub struct TextView {
     colors: Rc<RefCell<Colors>>,
     is_renumbering: Rc<RefCell<bool>>,
     image_widgets: Rc<RefCell<HashMap<String, (gdk::Texture, i32, i32)>>>,
-    image_anchors: Rc<RefCell<Vec<(gtk::TextChildAnchor, String)>>>,
-    rule_anchors: Rc<RefCell<Vec<gtk::TextChildAnchor>>>,
+    anchor_registry: Rc<RefCell<Vec<AnchorEntry>>>,
+    internal_clipboard: Rc<RefCell<Option<AnchorKind>>>,
+}
+#[derive(Clone)]
+pub enum AnchorKind {
+    Image(String),
+    Rule,
+}
+
+#[derive(Clone)]
+struct AnchorEntry {
+    anchor: gtk::TextChildAnchor,
+    kind: AnchorKind,
+    last_offset: i32,
 }
 impl TextView {
+    fn restore_anchors(&self) {
+        let buffer = &self.buffer;
+
+        // first handle RULE-tagged text from markdown load
+        if let Some(rule_tag) = buffer.tag_table().lookup(Tag::RULE) {
+            let mut iter = buffer.start_iter();
+            loop {
+                if iter.starts_tag(Some(&rule_tag)) {
+                    let mut start = iter.clone();
+                    let mut end = iter.clone();
+                    end.forward_to_tag_toggle(Some(&rule_tag));
+                    buffer.begin_irreversible_action();
+                    buffer.delete(&mut start, &mut end);
+                    let mut pos = buffer.iter_at_offset(start.offset());
+                    let anchor = buffer.create_child_anchor(&mut pos);
+                    let widget = self.create_rule_widget();
+                    self.textview.add_child_at_anchor(&widget, &anchor);
+                    self.anchor_registry.borrow_mut().push(AnchorEntry {
+                        anchor: anchor.clone(),
+                        kind: AnchorKind::Rule,
+                        last_offset: pos.offset(),
+                    });
+                    buffer.end_irreversible_action();
+                    iter = buffer.iter_at_offset(pos.offset());
+                }
+                if !iter.forward_char() {
+                    break;
+                }
+            }
+        }
+
+        // collect orphaned anchor positions (widget is gone, char remains)
+        let mut orphan_offsets: Vec<i32> = Vec::new();
+        let mut iter = buffer.start_iter();
+        loop {
+            if iter.char() == '\u{FFFC}' && iter.child_anchor().is_none() {
+                orphan_offsets.push(iter.offset());
+            }
+            if !iter.forward_char() {
+                break;
+            }
+        }
+
+        if orphan_offsets.is_empty() {
+            return;
+        }
+
+        // match orphans to registry entries by original insertion order
+        // registry entries whose anchors are deleted become orphans in order
+        let registry = self.anchor_registry.borrow();
+        let mut orphaned_entries: Vec<AnchorEntry> =
+            registry.iter().filter(|e| e.anchor.is_deleted()).cloned().collect();
+        orphaned_entries.sort_by_key(|e| e.last_offset); // ADD THIS
+        drop(registry);
+
+        // pair each orphan offset with its registry entry by index
+        for (i, &offset) in orphan_offsets.iter().enumerate() {
+            let entry = match orphaned_entries.get(i) {
+                Some(e) => e.clone(),
+                None => break,
+            };
+
+            let mut pos = buffer.iter_at_offset(offset);
+            let mut end = pos.clone();
+            end.forward_char();
+
+            buffer.begin_irreversible_action();
+            buffer.delete(&mut pos, &mut end);
+            let mut ins = buffer.iter_at_offset(offset);
+            let new_anchor = buffer.create_child_anchor(&mut ins);
+
+            let widget = match &entry.kind {
+                AnchorKind::Image(path) => {
+                    let store = self.image_widgets.borrow();
+                    if let Some((texture, w, h)) =
+                        store.get(path).map(|(t, w, h)| (t.clone(), *w, *h))
+                    {
+                        drop(store);
+                        self.create_resizable_image(&texture, path, w, h)
+                    } else {
+                        drop(store);
+                        buffer.end_irreversible_action();
+                        continue;
+                    }
+                }
+                AnchorKind::Rule => self.create_rule_widget(),
+            };
+
+            self.textview.add_child_at_anchor(&widget, &new_anchor);
+
+            // update registry with new anchor
+            let mut registry = self.anchor_registry.borrow_mut();
+            if let Some(reg_entry) = registry.iter_mut().find(|e| {
+                matches!(&e.kind, AnchorKind::Image(p)
+                if matches!(&entry.kind, AnchorKind::Image(ep) if p == ep))
+                    || (matches!(e.kind, AnchorKind::Rule)
+                        && matches!(entry.kind, AnchorKind::Rule)
+                        && e.anchor.is_deleted())
+            }) {
+                reg_entry.anchor = new_anchor;
+            }
+
+            buffer.end_irreversible_action();
+        }
+    }
     fn try_auto_rule(&self) -> bool {
         if !self.is_editable() {
             return false;
@@ -405,75 +522,18 @@ impl TextView {
         buffer.delete(&mut ls, &mut cur);
         let mut pos = buffer.get_insert_iter();
         let anchor = buffer.create_child_anchor(&mut pos);
-        self.rule_anchors.borrow_mut().push(anchor.clone());
+        self.anchor_registry.borrow_mut().push(AnchorEntry {
+            anchor: anchor.clone(),
+            kind: AnchorKind::Rule,
+            last_offset: pos.offset(),
+        });
         let rule_widget = self.create_rule_widget();
         self.textview.add_child_at_anchor(&rule_widget, &anchor);
         buffer.insert(&mut pos, "\n");
         buffer.end_user_action();
         true
     }
- fn render_rules(&self) {
-    let buffer = &self.buffer;
 
-    // restore orphaned rule anchors from undo
-    let rule_anchors = self.rule_anchors.borrow();
-    let mut orphan_offsets: Vec<i32> = Vec::new();
-    let mut iter = buffer.start_iter();
-    loop {
-        if iter.char() == '\u{FFFC}' && iter.child_anchor().is_none() {
-            // check it's a rule anchor not an image
-            let offset = iter.offset();
-            let is_image = self.image_widgets.borrow().values().any(|_| {
-                // image orphans are handled by restore_image_widgets
-                // we claim ones not in image_widgets
-                false
-            });
-            // simpler: just check image_anchors doesn't claim this offset
-            orphan_offsets.push(offset);
-        }
-        if !iter.forward_char() { break; }
-    }
-    drop(rule_anchors);
-
-    // re-render orphans as rule widgets
-    for &offset in orphan_offsets.iter().rev() {
-        let mut pos = buffer.iter_at_offset(offset);
-        let mut end = pos.clone();
-        end.forward_char();
-        buffer.begin_irreversible_action();
-        buffer.delete(&mut pos, &mut end);
-        let mut ins = buffer.iter_at_offset(offset);
-        let anchor = buffer.create_child_anchor(&mut ins);
-        let widget = self.create_rule_widget();
-        self.textview.add_child_at_anchor(&widget, &anchor);
-        self.rule_anchors.borrow_mut().push(anchor);
-        buffer.end_irreversible_action();
-    }
-
-    // also handle RULE-tagged text from markdown load
-    let rule_tag = match buffer.tag_table().lookup(Tag::RULE) {
-        Some(t) => t,
-        None => return,
-    };
-    let mut iter = buffer.start_iter();
-    loop {
-        if iter.starts_tag(Some(&rule_tag)) {
-            let mut start = iter.clone();
-            let mut end = iter.clone();
-            end.forward_to_tag_toggle(Some(&rule_tag));
-            buffer.begin_irreversible_action();
-            buffer.delete(&mut start, &mut end);
-            let mut pos = buffer.iter_at_offset(start.offset());
-            let anchor = buffer.create_child_anchor(&mut pos);
-            let widget = self.create_rule_widget();
-            self.textview.add_child_at_anchor(&widget, &anchor);
-            self.rule_anchors.borrow_mut().push(anchor);
-            buffer.end_irreversible_action();
-            iter = buffer.iter_at_offset(pos.offset());
-        }
-        if !iter.forward_char() { break; }
-    }
-}
     fn create_rule_widget(&self) -> gtk::Widget {
         let view_w = self.textview.allocated_width() - (MARGIN * 2) - 8;
 
@@ -545,8 +605,8 @@ impl TextView {
             colors: Rc::new(RefCell::new(Colors::new())),
             is_renumbering: Rc::new(RefCell::new(false)),
             image_widgets: Rc::new(RefCell::new(HashMap::new())),
-            image_anchors: Rc::new(RefCell::new(Vec::new())),
-            rule_anchors: Rc::new(RefCell::new(Vec::new())),
+            anchor_registry: Rc::new(RefCell::new(Vec::new())),
+            internal_clipboard: Rc::new(RefCell::new(None)),
         };
         this.top_level.add_controller(&this.get_key_press_handler_background());
         this.textview.add_controller(&this.get_key_press_handler());
@@ -953,18 +1013,6 @@ impl TextView {
 
         false
     }
-    fn paste_image(&self) -> bool {
-        let clipboard = self.textview.clipboard();
-
-        let this = self.clone();
-        clipboard.read_texture_async(None::<&gtk::gio::Cancellable>, move |result| {
-            if let Ok(Some(texture)) = result {
-                this.save_and_insert_image(texture);
-            }
-        });
-
-        false
-    }
 
     fn save_and_insert_image(&self, texture: gdk::Texture) {
         let filename = format!(
@@ -1001,7 +1049,11 @@ impl TextView {
             let pos_start = cursor.offset();
             let anchor = buffer.create_child_anchor(&mut cursor);
 
-            self.image_anchors.borrow_mut().push((anchor.clone(), path_str.clone()));
+            self.anchor_registry.borrow_mut().push(AnchorEntry {
+                anchor: anchor.clone(),
+                kind: AnchorKind::Image(path_str.clone()),
+                last_offset: cursor.offset(),
+            });
 
             let image_widget =
                 self.create_resizable_image(&texture, &path_str, initial_w, initial_h);
@@ -1119,6 +1171,88 @@ impl TextView {
 
         None
     }
+    fn copy_anchor(&self) -> bool {
+        let buffer = &self.buffer;
+        if let Some((start, end)) = buffer.selection_bounds() {
+            let mut iter = start.clone();
+            while iter.offset() < end.offset() {
+                if iter.char() == '\u{FFFC}' {
+                    if let Some(anchor) = iter.child_anchor() {
+                        let registry = self.anchor_registry.borrow();
+                        if let Some(entry) = registry.iter().find(|e| e.anchor == anchor) {
+                            *self.internal_clipboard.borrow_mut() = Some(entry.kind.clone());
+                            return true;
+                        }
+                    }
+                }
+                if !iter.forward_char() {
+                    break;
+                }
+            }
+        }
+        false
+    }
+
+    fn cut_anchor(&self) -> bool {
+        if self.copy_anchor() {
+            let buffer = &self.buffer;
+            if let Some((mut start, mut end)) = buffer.selection_bounds() {
+                buffer.begin_user_action();
+                buffer.delete(&mut start, &mut end);
+                buffer.end_user_action();
+            }
+            return true;
+        }
+        false
+    }
+    fn paste_image(&self) -> bool {
+        // check internal clipboard first (for cut/copied images)
+        let internal = self.internal_clipboard.borrow().clone();
+        if let Some(kind) = internal {
+            match kind {
+                AnchorKind::Image(path) => {
+                    let store = self.image_widgets.borrow();
+                    if let Some((texture, w, h)) =
+                        store.get(&path).map(|(t, w, h)| (t.clone(), *w, *h))
+                    {
+                        drop(store);
+                        self.save_and_insert_image(texture);
+                        return true;
+                    }
+                }
+                AnchorKind::Rule => {
+                    let buffer = &self.buffer;
+                    buffer.begin_user_action();
+                    let mut cursor = buffer.get_insert_iter();
+                    if !cursor.starts_line() {
+                        buffer.insert(&mut cursor, "\n");
+                    }
+                    let mut pos = buffer.get_insert_iter();
+                    let anchor = buffer.create_child_anchor(&mut pos);
+                    let widget = self.create_rule_widget();
+                    self.textview.add_child_at_anchor(&widget, &anchor);
+                    self.anchor_registry.borrow_mut().push(AnchorEntry {
+                        anchor,
+                        kind: AnchorKind::Rule,
+                        last_offset: cursor.offset(),
+                    });
+                    buffer.insert(&mut pos, "\n");
+                    buffer.end_user_action();
+                    return true;
+                }
+            }
+        }
+
+        // fall back to clipboard texture
+        let clipboard = self.textview.clipboard();
+        let this = self.clone();
+        clipboard.read_texture_async(None::<&gtk::gio::Cancellable>, move |result| {
+            if let Ok(Some(texture)) = result {
+                this.save_and_insert_image(texture);
+            }
+        });
+        false
+    }
     fn get_key_press_handler(&self) -> EventControllerKey {
         let controller = EventControllerKey::new();
         controller.connect_key_pressed({
@@ -1143,6 +1277,16 @@ impl TextView {
                         keys::l => this.edit_link(),
                         keys::n => this.apply_text_clear(),
                         keys::t => this.char_format(CharFormat::Mono),
+                        keys::c => {
+                            if !this.copy_anchor() {
+                                return Inhibit(false);
+                            }
+                        }
+                        keys::x => {
+                            if !this.cut_anchor() {
+                                return Inhibit(false);
+                            }
+                        }
                         keys::v => {
                             if this.paste_image() {
                                 return Inhibit(true);
@@ -1528,73 +1672,20 @@ impl TextView {
         }
     }
 
-pub fn undo(&self) {
-    if !self.is_editable() {
-        return;
-    }
-    self.buffer.undo();
-    self.restore_image_widgets();
-    self.render_rules();
-}
-
-pub fn redo(&self) {
-    if !self.is_editable() {
-        return;
-    }
-    self.buffer.redo();
-    self.restore_image_widgets();
-    self.render_rules();
-}
-    fn restore_image_widgets(&self) {
-        let buffer = &self.buffer;
-        let store = self.image_widgets.borrow();
-        if store.is_empty() {
+    pub fn undo(&self) {
+        if !self.is_editable() {
             return;
         }
-        let mut available_paths: Vec<String> = store.keys().cloned().collect();
-        available_paths.sort();
-        drop(store);
+        self.buffer.undo();
+        self.restore_anchors();
+    }
 
-        let mut orphan_offsets: Vec<i32> = Vec::new();
-        let mut iter = buffer.start_iter();
-        loop {
-            if iter.char() == '\u{FFFC}' && iter.child_anchor().is_none() {
-                orphan_offsets.push(iter.offset());
-            }
-            if !iter.forward_char() {
-                break;
-            }
-        }
-
-        if orphan_offsets.is_empty() {
+    pub fn redo(&self) {
+        if !self.is_editable() {
             return;
         }
-
-        for (i, &offset) in orphan_offsets.iter().rev().enumerate() {
-            let path_index = orphan_offsets.len() - 1 - i;
-            if let Some(path) = available_paths.get(path_index) {
-                let store = self.image_widgets.borrow();
-                if let Some((texture, w, h)) = store.get(path).map(|(t, w, h)| (t.clone(), *w, *h))
-                {
-                    drop(store);
-                    let mut pos = buffer.iter_at_offset(offset);
-                    let mut end = pos.clone();
-                    end.forward_char();
-
-                    buffer.begin_irreversible_action();
-                    buffer.delete(&mut pos, &mut end);
-                    let mut ins = buffer.iter_at_offset(offset);
-                    let anchor = buffer.create_child_anchor(&mut ins);
-                    let widget = self.create_resizable_image(&texture, path, w, h);
-                    self.textview.add_child_at_anchor(&widget, &anchor);
-                    let mut anchors = self.image_anchors.borrow_mut();
-                    if let Some(entry) = anchors.iter_mut().find(|(_, p)| p == path) {
-                        entry.0 = anchor;
-                    }
-                    buffer.end_irreversible_action();
-                }
-            }
-        }
+        self.buffer.redo();
+        self.restore_anchors();
     }
     pub fn to_markdown(&self) -> String {
         self.buffer.to_markdown()
@@ -1618,8 +1709,8 @@ pub fn redo(&self) {
         self.buffer.assign_markdown(markdown, false);
         self.buffer.end_irreversible_action();
         self.buffer.place_cursor(&self.buffer.start_iter());
+        self.restore_anchors();
     }
-
     fn insert_tab(&self) {
         if !self.is_editable() {
             return;
