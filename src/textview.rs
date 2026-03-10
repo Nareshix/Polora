@@ -16,6 +16,8 @@ use gtk::prelude::{Cast, ObjectExt};
 use gtk::EventControllerKey;
 
 use regex::Regex;
+use std::cell::Cell;
+use std::collections::HashMap;
 
 use crate::gdk_glue::{ColorCreator, GetColor};
 use std::cell::RefCell;
@@ -43,6 +45,13 @@ fn split_indent(line: &str) -> (&str, &str) {
     let trimmed = line.trim_start_matches(' ');
     let indent_len = line.len() - trimmed.len();
     (&line[..indent_len], trimmed)
+}
+
+fn get_image_store_dir() -> std::path::PathBuf {
+    let base = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = base.join("marko-editor").join("images");
+    std::fs::create_dir_all(&dir).ok();
+    dir
 }
 
 fn blocking_get(url: &str) -> Result<reqwest::blocking::Response, reqwest::Error> {
@@ -362,7 +371,7 @@ impl Colors {
 #[derive(Clone)]
 pub struct TextView {
     buffer: gtk::TextBuffer,
-    tags: Rc<TextTagManager>, // Rc needed for clones in closures
+    tags: Rc<TextTagManager>,
     textview: gtk::TextView,
     link_edit: Rc<LinkEdit>,
     search_bar: Rc<SearchBar>,
@@ -373,8 +382,9 @@ pub struct TextView {
     link_end: gtk::TextMark,
     colors: Rc<RefCell<Colors>>,
     is_renumbering: Rc<RefCell<bool>>,
+    image_widgets: Rc<RefCell<HashMap<String, (gdk::Texture, i32, i32)>>>,
+    image_anchors: Rc<RefCell<Vec<(gtk::TextChildAnchor, String)>>>,
 }
-
 impl TextView {
     pub fn new() -> Self {
         let ui_src = include_str!("textview.ui");
@@ -422,6 +432,8 @@ impl TextView {
             link_end,
             colors: Rc::new(RefCell::new(Colors::new())),
             is_renumbering: Rc::new(RefCell::new(false)),
+            image_widgets: Rc::new(RefCell::new(HashMap::new())),
+            image_anchors: Rc::new(RefCell::new(Vec::new())),
         };
         this.top_level.add_controller(&this.get_key_press_handler_background());
         this.textview.add_controller(&this.get_key_press_handler());
@@ -846,19 +858,318 @@ impl TextView {
             "image_{}.png",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
         );
-        let path = format!("/tmp/{}", filename);
+        let path = get_image_store_dir().join(&filename);
+        let path_str = path.to_string_lossy().to_string();
 
-        if texture.save_to_png(&path) {
+        if texture.save_to_png(&path_str) {
+            let aspect = texture.height() as f64 / texture.width() as f64;
+            let initial_w = 300i32;
+            let initial_h = (initial_w as f64 * aspect) as i32;
+
+            self.image_widgets
+                .borrow_mut()
+                .insert(path_str.clone(), (texture.clone(), initial_w, initial_h));
+
             let buffer = &self.buffer;
+            buffer.begin_user_action();
+
             let mut cursor = buffer.get_insert_iter();
+
+            if !cursor.starts_line() {
+                buffer.insert(&mut cursor, "\n");
+            }
+
             let pos_start = cursor.offset();
 
-            buffer.insert_paintable(&mut cursor, &texture);
+            let anchor = buffer.create_child_anchor(&mut cursor);
 
-            buffer.apply_image_offset(&cursor, &path, "", pos_start);
+            // store anchor reference for undo restore
+            self.image_anchors.borrow_mut().push((anchor.clone(), path_str.clone()));
+
+            let image_widget =
+                self.create_resizable_image(&texture, &path_str, initial_w, initial_h);
+            self.textview.add_child_at_anchor(&image_widget, &anchor);
+
+            buffer.apply_image_offset(&cursor, &path_str, "", pos_start);
+
+            if cursor.is_end() || !cursor.ends_line() {
+                buffer.insert(&mut cursor, "\n");
+            }
+
+            cursor.forward_line();
+            buffer.place_cursor(&cursor);
+
+            buffer.end_user_action();
         }
     }
+    fn create_resizable_image(
+        &self,
+        texture: &gdk::Texture,
+        path: &str,
+        initial_width: i32,
+        initial_height: i32,
+    ) -> gtk::Widget {
+        let image_widgets = self.image_widgets.clone();
+        let path_owned = path.to_string();
 
+        let picture = gtk::Picture::for_paintable(Some(texture));
+        picture.set_size_request(initial_width, initial_height);
+        picture.set_can_shrink(true);
+        picture.set_keep_aspect_ratio(false);
+        picture.set_hexpand(false);
+        picture.set_vexpand(false);
+        picture.set_halign(gtk::Align::Start);
+        picture.set_valign(gtk::Align::Start);
+        picture.set_can_focus(false);
+        picture.set_focusable(false);
+
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&picture));
+        overlay.set_size_request(initial_width, initial_height);
+        overlay.set_hexpand(false);
+        overlay.set_vexpand(false);
+        overlay.set_halign(gtk::Align::Start);
+        overlay.set_valign(gtk::Align::Start);
+        overlay.set_cursor_from_name(Some("default"));
+        overlay.set_can_focus(false);
+        overlay.set_focusable(false);
+
+        // current committed size
+        let current_w = Rc::new(Cell::new(initial_width));
+        let current_h = Rc::new(Cell::new(initial_height));
+        // snapshot at drag start
+        let snap_w = Rc::new(Cell::new(initial_width));
+        let snap_h = Rc::new(Cell::new(initial_height));
+
+        let make_handle =
+            |width: i32, height: i32, halign: gtk::Align, valign: gtk::Align, cursor_name: &str| {
+                let handle = gtk::DrawingArea::new();
+                handle.set_size_request(width, height);
+                handle.set_halign(halign);
+                handle.set_valign(valign);
+                handle.set_hexpand(false);
+                handle.set_vexpand(false);
+                handle.set_cursor_from_name(Some(cursor_name));
+                handle.set_opacity(0.0);
+                handle.set_can_focus(false);
+                handle.set_focusable(false);
+
+                let motion = gtk::EventControllerMotion::new();
+                let handle_ref = handle.clone();
+                motion.connect_enter(move |_, _, _| {
+                    handle_ref.set_opacity(1.0);
+                });
+                let handle_ref = handle.clone();
+                motion.connect_leave(move |_| {
+                    handle_ref.set_opacity(0.0);
+                });
+                handle.add_controller(&motion);
+                handle
+            };
+
+        // diagonal handle (bottom-right)
+        let handle = make_handle(20, 20, gtk::Align::End, gtk::Align::End, "se-resize");
+        handle.set_draw_func(|_, cr, w, h| {
+            cr.set_source_rgba(0.9, 0.9, 0.9, 0.9);
+            cr.move_to(w as f64, 0.0);
+            cr.line_to(w as f64, h as f64);
+            cr.line_to(0.0, h as f64);
+            cr.fill().ok();
+        });
+        overlay.add_overlay(&handle);
+
+        let drag = gtk::GestureDrag::new();
+        drag.connect_drag_begin({
+            let current_w = current_w.clone();
+            let current_h = current_h.clone();
+            let snap_w = snap_w.clone();
+            let snap_h = snap_h.clone();
+            let handle = handle.clone();
+            move |_, _x, _y| {
+                snap_w.set(current_w.get());
+                snap_h.set(current_h.get());
+                handle.set_opacity(1.0);
+            }
+        });
+        drag.connect_drag_update({
+            let snap_w = snap_w.clone();
+            let snap_h = snap_h.clone();
+            let overlay = overlay.clone();
+            let picture = picture.clone();
+            move |_, offset_x, offset_y| {
+                let new_w = (snap_w.get() as f64 + offset_x).max(50.0) as i32;
+                let new_h = (snap_h.get() as f64 + offset_y).max(50.0) as i32;
+                overlay.set_size_request(new_w, new_h);
+                picture.set_size_request(new_w, new_h);
+                overlay.queue_resize();
+            }
+        });
+        drag.connect_drag_end({
+            let current_w = current_w.clone();
+            let current_h = current_h.clone();
+            let snap_w = snap_w.clone();
+            let snap_h = snap_h.clone();
+            let overlay = overlay.clone();
+            let handle = handle.clone();
+            let image_widgets = image_widgets.clone();
+            let path_owned = path_owned.clone();
+            move |_, offset_x, offset_y| {
+                let new_w = (snap_w.get() as f64 + offset_x).max(50.0) as i32;
+                let new_h = (snap_h.get() as f64 + offset_y).max(50.0) as i32;
+                current_w.set(new_w);
+                current_h.set(new_h);
+                overlay.set_size_request(new_w, new_h);
+                handle.set_opacity(0.0);
+                // persist size so undo restore uses latest size
+                if let Some(entry) = image_widgets.borrow_mut().get_mut(&path_owned) {
+                    entry.1 = new_w;
+                    entry.2 = new_h;
+                }
+            }
+        });
+        handle.add_controller(&drag);
+
+        // right handle (horizontal only)
+        let handle_right = make_handle(8, 40, gtk::Align::End, gtk::Align::Center, "e-resize");
+        handle_right.set_draw_func(|_, cr, w, h| {
+            cr.set_source_rgba(0.9, 0.9, 0.9, 0.9);
+            cr.rectangle(0.0, 0.0, w as f64, h as f64);
+            cr.fill().ok();
+        });
+        overlay.add_overlay(&handle_right);
+
+        let drag_right = gtk::GestureDrag::new();
+        drag_right.connect_drag_begin({
+            let current_w = current_w.clone();
+            let snap_w = snap_w.clone();
+            let handle_right = handle_right.clone();
+            move |_, _, _| {
+                snap_w.set(current_w.get());
+                handle_right.set_opacity(1.0);
+            }
+        });
+        drag_right.connect_drag_update({
+            let snap_w = snap_w.clone();
+            let current_h = current_h.clone();
+            let overlay = overlay.clone();
+            let picture = picture.clone();
+            move |_, offset_x, _| {
+                let new_w = (snap_w.get() as f64 + offset_x).max(50.0) as i32;
+                let h = current_h.get();
+                overlay.set_size_request(new_w, h);
+                picture.set_size_request(new_w, h);
+                overlay.queue_resize();
+            }
+        });
+        drag_right.connect_drag_end({
+            let current_w = current_w.clone();
+            let snap_w = snap_w.clone();
+            let handle_right = handle_right.clone();
+            let image_widgets = image_widgets.clone();
+            let path_owned = path_owned.clone();
+            let current_h = current_h.clone();
+            move |_, offset_x, _| {
+                let new_w = (snap_w.get() as f64 + offset_x).max(50.0) as i32;
+                current_w.set(new_w);
+                handle_right.set_opacity(0.0);
+                if let Some(entry) = image_widgets.borrow_mut().get_mut(&path_owned) {
+                    entry.1 = new_w;
+                    entry.2 = current_h.get();
+                }
+            }
+        });
+        handle_right.add_controller(&drag_right);
+
+        // bottom handle (vertical only)
+        let handle_bottom = make_handle(40, 8, gtk::Align::Center, gtk::Align::End, "s-resize");
+        handle_bottom.set_draw_func(|_, cr, w, h| {
+            cr.set_source_rgba(0.9, 0.9, 0.9, 0.9);
+            cr.rectangle(0.0, 0.0, w as f64, h as f64);
+            cr.fill().ok();
+        });
+        overlay.add_overlay(&handle_bottom);
+
+        let drag_bottom = gtk::GestureDrag::new();
+        drag_bottom.connect_drag_begin({
+            let current_h = current_h.clone();
+            let snap_h = snap_h.clone();
+            let handle_bottom = handle_bottom.clone();
+            move |_, _, _| {
+                snap_h.set(current_h.get());
+                handle_bottom.set_opacity(1.0);
+            }
+        });
+        drag_bottom.connect_drag_update({
+            let snap_h = snap_h.clone();
+            let current_w = current_w.clone();
+            let overlay = overlay.clone();
+            let picture = picture.clone();
+            move |_, _, offset_y| {
+                let w = current_w.get();
+                let new_h = (snap_h.get() as f64 + offset_y).max(50.0) as i32;
+                overlay.set_size_request(w, new_h);
+                picture.set_size_request(w, new_h);
+                overlay.queue_resize();
+            }
+        });
+        drag_bottom.connect_drag_end({
+            let current_h = current_h.clone();
+            let snap_h = snap_h.clone();
+            let handle_bottom = handle_bottom.clone();
+            let image_widgets = image_widgets.clone();
+            let path_owned = path_owned.clone();
+            let current_w = current_w.clone();
+            move |_, _, offset_y| {
+                let new_h = (snap_h.get() as f64 + offset_y).max(50.0) as i32;
+                current_h.set(new_h);
+                handle_bottom.set_opacity(0.0);
+                if let Some(entry) = image_widgets.borrow_mut().get_mut(&path_owned) {
+                    entry.1 = current_w.get();
+                    entry.2 = new_h;
+                }
+            }
+        });
+        handle_bottom.add_controller(&drag_bottom);
+
+        // show all handles on image hover
+        let motion_overlay = gtk::EventControllerMotion::new();
+        {
+            let handle = handle.clone();
+            let handle_right = handle_right.clone();
+            let handle_bottom = handle_bottom.clone();
+            motion_overlay.connect_enter(move |_, _, _| {
+                handle.set_opacity(1.0);
+                handle_right.set_opacity(1.0);
+                handle_bottom.set_opacity(1.0);
+            });
+        }
+        {
+            let handle = handle.clone();
+            let handle_right = handle_right.clone();
+            let handle_bottom = handle_bottom.clone();
+            motion_overlay.connect_leave(move |_| {
+                handle.set_opacity(0.0);
+                handle_right.set_opacity(0.0);
+                handle_bottom.set_opacity(0.0);
+            });
+        }
+        overlay.add_controller(&motion_overlay);
+
+        // wrap in box - spacing adds padding around image
+        let container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        container.set_hexpand(false);
+        container.set_vexpand(false);
+        container.set_halign(gtk::Align::Start);
+        container.set_valign(gtk::Align::Start);
+        container.set_can_focus(false);
+        container.set_focusable(false);
+        container.set_margin_top(6);
+        container.set_margin_bottom(6);
+        container.set_margin_start(4);
+        container.append(&overlay);
+
+        container.upcast::<gtk::Widget>()
+    }
     pub fn get_widget(&self) -> &gtk::Widget {
         &self.top_level
     }
@@ -1337,15 +1648,67 @@ impl TextView {
             return;
         }
         self.buffer.undo();
+        self.restore_image_widgets();
     }
-
     pub fn redo(&self) {
         if !self.is_editable() {
             return;
         }
         self.buffer.redo();
+        self.restore_image_widgets();
     }
 
+    fn restore_image_widgets(&self) {
+        let buffer = &self.buffer;
+        let store = self.image_widgets.borrow();
+        if store.is_empty() {
+            return;
+        }
+        let mut available_paths: Vec<String> = store.keys().cloned().collect();
+        available_paths.sort();
+        drop(store);
+
+        let mut orphan_offsets: Vec<i32> = Vec::new();
+        let mut iter = buffer.start_iter();
+        loop {
+            if iter.char() == '\u{FFFC}' && iter.child_anchor().is_none() {
+                orphan_offsets.push(iter.offset());
+            }
+            if !iter.forward_char() {
+                break;
+            }
+        }
+
+        if orphan_offsets.is_empty() {
+            return;
+        }
+
+        for (i, &offset) in orphan_offsets.iter().rev().enumerate() {
+            let path_index = orphan_offsets.len() - 1 - i;
+            if let Some(path) = available_paths.get(path_index) {
+                let store = self.image_widgets.borrow();
+                if let Some((texture, w, h)) = store.get(path).map(|(t, w, h)| (t.clone(), *w, *h))
+                {
+                    drop(store);
+                    let mut pos = buffer.iter_at_offset(offset);
+                    let mut end = pos.clone();
+                    end.forward_char();
+
+                    buffer.begin_irreversible_action();
+                    buffer.delete(&mut pos, &mut end);
+                    let mut ins = buffer.iter_at_offset(offset);
+                    let anchor = buffer.create_child_anchor(&mut ins);
+                    let widget = self.create_resizable_image(&texture, path, w, h);
+                    self.textview.add_child_at_anchor(&widget, &anchor);
+                    let mut anchors = self.image_anchors.borrow_mut();
+                    if let Some(entry) = anchors.iter_mut().find(|(_, p)| p == path) {
+                        entry.0 = anchor;
+                    }
+                    buffer.end_irreversible_action();
+                }
+            }
+        }
+    }
     pub fn to_markdown(&self) -> String {
         self.buffer.to_markdown()
     }
@@ -1369,8 +1732,6 @@ impl TextView {
         self.buffer.end_irreversible_action();
         self.buffer.place_cursor(&self.buffer.start_iter());
     }
-
-
 
     fn insert_tab(&self) {
         if !self.is_editable() {

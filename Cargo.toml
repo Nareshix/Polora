@@ -19,6 +19,7 @@ regex = "1"
 lazy_static = "1.4.*"
 html-escape = "0.2.*"
 percent-encoding = "2.1.*"
+dirs = "6.0.0"
 
 [dependencies.gtk]
 version = "0.*"
