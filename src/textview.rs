@@ -7,6 +7,7 @@ use crate::{builder_get, connect, connect_fwd1};
 
 extern crate html_escape;
 
+use gdk::cairo;
 use gtk::gio::File;
 use gtk::glib;
 use gtk::glib::signal::Inhibit;
@@ -16,7 +17,6 @@ use gtk::prelude::{Cast, ObjectExt};
 use gtk::EventControllerKey;
 
 use regex::Regex;
-use std::cell::Cell;
 use std::collections::HashMap;
 
 use crate::gdk_glue::{ColorCreator, GetColor};
@@ -384,8 +384,120 @@ pub struct TextView {
     is_renumbering: Rc<RefCell<bool>>,
     image_widgets: Rc<RefCell<HashMap<String, (gdk::Texture, i32, i32)>>>,
     image_anchors: Rc<RefCell<Vec<(gtk::TextChildAnchor, String)>>>,
+    rule_anchors: Rc<RefCell<Vec<gtk::TextChildAnchor>>>,
 }
 impl TextView {
+    fn try_auto_rule(&self) -> bool {
+        if !self.is_editable() {
+            return false;
+        }
+        let buffer = &self.buffer;
+        let cursor = buffer.get_insert_iter();
+        let mut line_start = cursor.clone();
+        line_start.set_line_offset(0);
+        let line_text = buffer.text(&line_start, &cursor, false);
+        if line_text.as_str().trim() != "---" {
+            return false;
+        }
+        buffer.begin_user_action();
+        let mut ls = line_start.clone();
+        let mut cur = cursor.clone();
+        buffer.delete(&mut ls, &mut cur);
+        let mut pos = buffer.get_insert_iter();
+        let anchor = buffer.create_child_anchor(&mut pos);
+        self.rule_anchors.borrow_mut().push(anchor.clone());
+        let rule_widget = self.create_rule_widget();
+        self.textview.add_child_at_anchor(&rule_widget, &anchor);
+        buffer.insert(&mut pos, "\n");
+        buffer.end_user_action();
+        true
+    }
+ fn render_rules(&self) {
+    let buffer = &self.buffer;
+
+    // restore orphaned rule anchors from undo
+    let rule_anchors = self.rule_anchors.borrow();
+    let mut orphan_offsets: Vec<i32> = Vec::new();
+    let mut iter = buffer.start_iter();
+    loop {
+        if iter.char() == '\u{FFFC}' && iter.child_anchor().is_none() {
+            // check it's a rule anchor not an image
+            let offset = iter.offset();
+            let is_image = self.image_widgets.borrow().values().any(|_| {
+                // image orphans are handled by restore_image_widgets
+                // we claim ones not in image_widgets
+                false
+            });
+            // simpler: just check image_anchors doesn't claim this offset
+            orphan_offsets.push(offset);
+        }
+        if !iter.forward_char() { break; }
+    }
+    drop(rule_anchors);
+
+    // re-render orphans as rule widgets
+    for &offset in orphan_offsets.iter().rev() {
+        let mut pos = buffer.iter_at_offset(offset);
+        let mut end = pos.clone();
+        end.forward_char();
+        buffer.begin_irreversible_action();
+        buffer.delete(&mut pos, &mut end);
+        let mut ins = buffer.iter_at_offset(offset);
+        let anchor = buffer.create_child_anchor(&mut ins);
+        let widget = self.create_rule_widget();
+        self.textview.add_child_at_anchor(&widget, &anchor);
+        self.rule_anchors.borrow_mut().push(anchor);
+        buffer.end_irreversible_action();
+    }
+
+    // also handle RULE-tagged text from markdown load
+    let rule_tag = match buffer.tag_table().lookup(Tag::RULE) {
+        Some(t) => t,
+        None => return,
+    };
+    let mut iter = buffer.start_iter();
+    loop {
+        if iter.starts_tag(Some(&rule_tag)) {
+            let mut start = iter.clone();
+            let mut end = iter.clone();
+            end.forward_to_tag_toggle(Some(&rule_tag));
+            buffer.begin_irreversible_action();
+            buffer.delete(&mut start, &mut end);
+            let mut pos = buffer.iter_at_offset(start.offset());
+            let anchor = buffer.create_child_anchor(&mut pos);
+            let widget = self.create_rule_widget();
+            self.textview.add_child_at_anchor(&widget, &anchor);
+            self.rule_anchors.borrow_mut().push(anchor);
+            buffer.end_irreversible_action();
+            iter = buffer.iter_at_offset(pos.offset());
+        }
+        if !iter.forward_char() { break; }
+    }
+}
+    fn create_rule_widget(&self) -> gtk::Widget {
+        let view_w = self.textview.allocated_width() - (MARGIN * 2) - 8;
+
+        let drawing = gtk::DrawingArea::new();
+        drawing.set_size_request(view_w, 16);
+        drawing.set_can_focus(false);
+        drawing.set_focusable(false);
+
+        drawing.set_draw_func(|_, cr, w, _h| {
+            let y = 8.0;
+            let x0 = 4.0;
+            let x1 = w as f64 - 4.0;
+
+            cr.set_source_rgba(0.4, 0.4, 0.4, 0.8);
+            cr.set_line_width(1.5);
+            cr.set_line_cap(cairo::LineCap::Round);
+
+            cr.move_to(x0, y);
+            cr.line_to(x1, y);
+            cr.stroke().ok();
+        });
+
+        drawing.upcast::<gtk::Widget>()
+    }
     pub fn new() -> Self {
         let ui_src = include_str!("textview.ui");
         let b = gtk::Builder::new();
@@ -434,6 +546,7 @@ impl TextView {
             is_renumbering: Rc::new(RefCell::new(false)),
             image_widgets: Rc::new(RefCell::new(HashMap::new())),
             image_anchors: Rc::new(RefCell::new(Vec::new())),
+            rule_anchors: Rc::new(RefCell::new(Vec::new())),
         };
         this.top_level.add_controller(&this.get_key_press_handler_background());
         this.textview.add_controller(&this.get_key_press_handler());
@@ -1067,6 +1180,10 @@ impl TextView {
                         keys::F4 => this.char_format(CharFormat::Blue),
                         keys::Tab | keys::ISO_Left_Tab => this.insert_tab(),
                         keys::KP_Enter | keys::Return => {
+                            if this.try_auto_rule() {
+                                return Inhibit(true);
+                            }
+
                             if this.try_list_continue() {
                                 return Inhibit(true);
                             }
@@ -1411,21 +1528,23 @@ impl TextView {
         }
     }
 
-    pub fn undo(&self) {
-        if !self.is_editable() {
-            return;
-        }
-        self.buffer.undo();
-        self.restore_image_widgets();
+pub fn undo(&self) {
+    if !self.is_editable() {
+        return;
     }
-    pub fn redo(&self) {
-        if !self.is_editable() {
-            return;
-        }
-        self.buffer.redo();
-        self.restore_image_widgets();
-    }
+    self.buffer.undo();
+    self.restore_image_widgets();
+    self.render_rules();
+}
 
+pub fn redo(&self) {
+    if !self.is_editable() {
+        return;
+    }
+    self.buffer.redo();
+    self.restore_image_widgets();
+    self.render_rules();
+}
     fn restore_image_widgets(&self) {
         let buffer = &self.buffer;
         let store = self.image_widgets.borrow();
