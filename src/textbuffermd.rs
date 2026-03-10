@@ -295,7 +295,7 @@ impl TextBufferMd for gtk::TextBuffer {
                                     *i += 1;
                                     r
                                 } else {
-                                    String::from("*")
+                                    String::from("•")
                                 },
                             )
                             .as_str(),

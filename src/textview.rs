@@ -761,8 +761,7 @@ impl TextView {
             let line_text = buffer.text(&line_iter, &line_end, false);
             let (indent, item_text) = split_indent(line_text.as_str());
 
-            let is_ul = item_text.starts_with("• ");
-            // instead of: let num = &item_text[..p];
+            let is_ul = item_text.starts_with("• ") || item_text.starts_with("* ");
             let is_ol = !is_ul && {
                 let dot_pos = item_text.find(". ");
                 dot_pos
@@ -1111,7 +1110,7 @@ impl TextView {
 
         false
     }
-    
+
     fn calculate_image_display_size(texture: &gdk::Texture, available_width: i32) -> (i32, i32) {
         let nat_w = texture.width();
         let nat_h = texture.height();
