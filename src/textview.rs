@@ -1146,145 +1146,163 @@ impl TextView {
         true
     }
 
-    fn try_list_continue(&self) -> bool {
-        if !self.is_editable() {
-            return false;
-        }
-        let buffer = &self.buffer;
-        let cursor = buffer.get_insert_iter();
+fn try_list_continue(&self) -> bool {
+    if !self.is_editable() {
+        return false;
+    }
+    let buffer = &self.buffer;
+    let cursor = buffer.get_insert_iter();
 
-        if !cursor.ends_line() {
-            return false;
-        }
+    // Get full line text regardless of cursor position within line
+    let mut line_start = cursor.clone();
+    line_start.set_line_offset(0);
+    let mut line_end = cursor.clone();
+    if !line_end.ends_line() {
+        line_end.forward_to_line_end();
+    }
 
-        let mut line_start = cursor.clone();
-        line_start.set_line_offset(0);
+    // Only continue list if cursor is at end of line
+    if cursor.offset() != line_end.offset() {
+        return false;
+    }
 
-        if line_start.char() == '\u{FFFC}' {
-            if let Some((_checked, _tag)) = buffer.get_checkbox_at_iter(&line_start) {
-                let mut content_start = line_start.clone();
-                content_start.forward_chars(2);
-                let content = buffer.text(&content_start, &cursor, false);
+    // Handle checkbox line continuation (keep existing logic)
+    if line_start.char() == '\u{FFFC}' {
+        if let Some((_checked, _tag)) = buffer.get_checkbox_at_iter(&line_start) {
+            let mut content_start = line_start.clone();
+            content_start.forward_chars(2);
+            let content = buffer.text(&content_start, &line_end, false);
 
-                if content.trim().is_empty() {
-                    buffer.begin_user_action();
-                    let mut ls = line_start.clone();
-                    let mut cur = cursor.clone();
-                    buffer.delete(&mut ls, &mut cur);
-                    buffer.end_user_action();
-                    return true;
-                } else {
-                    buffer.begin_user_action();
-                    let mut pos = cursor.clone();
-                    buffer.insert(&mut pos, "\n");
+            if content.trim().is_empty() {
+                buffer.begin_user_action();
+                let mut ls = line_start.clone();
+                let mut cur = line_end.clone();
+                buffer.delete(&mut ls, &mut cur);
+                buffer.end_user_action();
+                return true;
+            } else {
+                buffer.begin_user_action();
+                let mut pos = line_end.clone();
+                buffer.insert(&mut pos, "\n");
 
-                    let mut insert_pos = buffer.get_insert_iter();
-                    let anchor = buffer.create_child_anchor(&mut insert_pos);
+                let mut insert_pos = buffer.get_insert_iter();
+                let anchor = buffer.create_child_anchor(&mut insert_pos);
 
-                    let tag = buffer.create_checkbox_tag(false);
-                    let anchor_char_start = buffer.iter_at_offset(insert_pos.offset() - 1);
-                    buffer.apply_tag(&tag, &anchor_char_start, &insert_pos);
+                let tag = buffer.create_checkbox_tag(false);
+                let anchor_char_start = buffer.iter_at_offset(insert_pos.offset() - 1);
+                buffer.apply_tag(&tag, &anchor_char_start, &insert_pos);
 
-                    let widget = self.create_checkbox_widget(&anchor, false);
-                    self.textview.add_child_at_anchor(&widget, &anchor);
+                let widget = self.create_checkbox_widget(&anchor, false);
+                self.textview.add_child_at_anchor(&widget, &anchor);
 
-                    self.anchor_registry.borrow_mut().push(AnchorEntry {
-                        anchor,
-                        kind: AnchorKind::Checkbox,
-                        last_offset: insert_pos.offset(),
-                    });
+                self.anchor_registry.borrow_mut().push(AnchorEntry {
+                    anchor,
+                    kind: AnchorKind::Checkbox,
+                    last_offset: insert_pos.offset(),
+                });
 
-                    buffer.insert(&mut insert_pos, " ");
-                    buffer.end_user_action();
-                    return true;
-                }
+                buffer.insert(&mut insert_pos, " ");
+                buffer.end_user_action();
+                return true;
             }
         }
+    }
 
-        let line_text = buffer.text(&line_start, &cursor, false);
-        let line = line_text.as_str();
+    let line_text = buffer.text(&line_start, &line_end, false);
+    let line = line_text.as_str();
+    let (indent, item_text) = split_indent(line);
 
-        let (indent, item_text) = split_indent(line);
-
-        let (is_ol, next_prefix) = if item_text.starts_with("• ") {
-            (false, Some(format!("{}• ", indent)))
-        } else {
-            let dot_pos = item_text.find(". ");
-            if let Some(pos) = dot_pos {
-                let num_str: String =
-                    item_text.chars().take(item_text[..pos].chars().count()).collect();
-                if !num_str.is_empty() && num_str.chars().all(|c| c.is_ascii_digit()) {
-                    if let Ok(n) = num_str.parse::<u64>() {
-                        (true, Some(format!("{}{}. ", indent, n + 1)))
-                    } else {
-                        (false, None)
-                    }
+    let (is_ol, next_prefix) = if item_text.starts_with("• ") {
+        (false, Some(format!("{}• ", indent)))
+    } else if item_text.starts_with("* ") {
+        (false, Some(format!("{}• ", indent)))
+    } else {
+        // Check for ordered list: starts with digits followed by ". "
+        let dot_pos = item_text.find(". ");
+        if let Some(pos) = dot_pos {
+            let num_str: String = item_text[..pos].to_string();
+            if !num_str.is_empty() && num_str.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(n) = num_str.parse::<u64>() {
+                    (true, Some(format!("{}{}. ", indent, n + 1)))
                 } else {
                     (false, None)
                 }
             } else {
                 (false, None)
             }
+        } else {
+            (false, None)
+        }
+    };
+
+    if let Some(prefix) = next_prefix {
+        // Count chars after the prefix to see if line is empty
+        let prefix_display_len = if is_ol {
+            // e.g. "1. " → chars before first ". " plus 2
+            item_text.find(". ").map(|p| indent.len() + p + 2).unwrap_or(prefix.len())
+        } else {
+            prefix.len() // "• " = 2 chars + indent
         };
 
-        if let Some(prefix) = next_prefix {
-            let prefix_char_len = prefix.trim_start().chars().count();
-            let content: String = item_text.chars().skip(prefix_char_len).collect();
-            if content.trim().is_empty() && !item_text.trim().is_empty() {
-                buffer.begin_user_action();
-                let mut ls = line_start.clone();
-                let mut cur = cursor.clone();
-                buffer.delete(&mut ls, &mut cur);
-                buffer.end_user_action();
-                return true;
-            }
+        let content: String = line.chars().skip(prefix_display_len).collect();
 
-            let current_line = cursor.line();
-
+        if content.trim().is_empty() {
+            // Empty list item — exit the list
             buffer.begin_user_action();
-            let mut pos = cursor.clone();
-            buffer.insert(&mut pos, &format!("\n{}", prefix));
-
-            let new_line = current_line + 1;
-            let new_bol = match buffer.iter_at_line(new_line) {
-                Some(i) => i,
-                None => {
-                    buffer.end_user_action();
-                    return true;
-                }
-            };
-            let mut new_eol = new_bol.clone();
-            if !new_eol.ends_line() {
-                new_eol.forward_to_line_end();
-            }
-
-            let line_tag =
-                buffer.tag_table().lookup(if is_ol { Tag::LIST_OL } else { Tag::LIST_UL }).unwrap();
-            buffer.apply_tag(&line_tag, &new_bol, &new_eol);
-
-            let new_bol2 = match buffer.iter_at_line(new_line) {
-                Some(i) => i,
-                None => {
-                    buffer.end_user_action();
-                    return true;
-                }
-            };
-            let mut prefix_end = new_bol2.clone();
-            prefix_end.forward_chars(prefix.chars().count() as i32);
-            let prefix_tag = buffer
-                .tag_table()
-                .lookup(if is_ol { Tag::LIST_OL_PREFIX } else { Tag::LIST_UL_PREFIX })
-                .unwrap();
-            buffer.apply_tag(&prefix_tag, &new_bol2, &prefix_end);
-
+            let mut ls = line_start.clone();
+            let mut le = line_end.clone();
+            buffer.delete(&mut ls, &mut le);
             buffer.end_user_action();
-            self.tags.text_edit(TextEdit::NewLine);
             return true;
         }
 
-        false
+        let current_line = cursor.line();
+
+        buffer.begin_user_action();
+        let mut pos = line_end.clone();
+        buffer.insert(&mut pos, &format!("\n{}", prefix));
+
+        let new_line = current_line + 1;
+        let new_bol = match buffer.iter_at_line(new_line) {
+            Some(i) => i,
+            None => {
+                buffer.end_user_action();
+                return true;
+            }
+        };
+        let mut new_eol = new_bol.clone();
+        if !new_eol.ends_line() {
+            new_eol.forward_to_line_end();
+        }
+
+        let line_tag = buffer
+            .tag_table()
+            .lookup(if is_ol { Tag::LIST_OL } else { Tag::LIST_UL })
+            .unwrap();
+        buffer.apply_tag(&line_tag, &new_bol, &new_eol);
+
+        let new_bol2 = match buffer.iter_at_line(new_line) {
+            Some(i) => i,
+            None => {
+                buffer.end_user_action();
+                return true;
+            }
+        };
+        let mut prefix_end = new_bol2.clone();
+        prefix_end.forward_chars(prefix.chars().count() as i32);
+        let prefix_tag = buffer
+            .tag_table()
+            .lookup(if is_ol { Tag::LIST_OL_PREFIX } else { Tag::LIST_UL_PREFIX })
+            .unwrap();
+        buffer.apply_tag(&prefix_tag, &new_bol2, &prefix_end);
+
+        buffer.end_user_action();
+        self.tags.text_edit(TextEdit::NewLine);
+        return true;
     }
 
+    false
+}
     fn calculate_image_display_size(texture: &gdk::Texture, available_width: i32) -> (i32, i32) {
         let nat_w = texture.width();
         let nat_h = texture.height();
@@ -2014,6 +2032,45 @@ impl TextView {
         self.buffer.end_user_action();
     }
 
+    pub fn resize_images_to_fit(&self) {
+        let available = self.textview.allocated_width();
+        if available <= 1 {
+            return; // still not laid out, skip
+        }
+
+        let registry = self.anchor_registry.borrow();
+        for entry in registry.iter() {
+            if let AnchorKind::Image(path) = &entry.kind {
+                if entry.anchor.is_deleted() {
+                    continue;
+                }
+                // Get the texture we already loaded
+                let texture_opt = self.image_widgets.borrow().get(path).map(|(t, _, _)| t.clone());
+
+                if let Some(texture) = texture_opt {
+                    let (w, h) = Self::calculate_image_display_size(&texture, available);
+
+                    // Update the cached size
+                    self.image_widgets.borrow_mut().entry(path.clone()).and_modify(|e| {
+                        e.1 = w;
+                        e.2 = h;
+                    });
+
+                    // Find and resize the actual widget
+                    let widgets = entry.anchor.widgets();
+                    for widget in widgets {
+                        widget.set_size_request(w, h);
+                        // The picture is inside a container box
+                        let mut child = widget.first_child();
+                        while let Some(c) = child {
+                            c.set_size_request(w, h);
+                            child = c.next_sibling();
+                        }
+                    }
+                }
+            }
+        }
+    }
     pub fn new_content_markdown(&self, markdown: &str) {
         self.buffer.begin_irreversible_action();
         self.buffer.assign_markdown(markdown, false);
@@ -2023,14 +2080,15 @@ impl TextView {
 
         let textview = self.textview.clone();
         let buffer = self.buffer.clone();
+        let this = self.clone();
         glib::idle_add_local(move || {
+            this.resize_images_to_fit();
             if let Some(mut iter) = buffer.iter_at_line(0) {
                 textview.scroll_to_iter(&mut iter, 0.0, true, 0.0, 0.0);
             }
             glib::ControlFlow::Break
         });
     }
-
     fn insert_tab(&self) {
         if !self.is_editable() {
             return;
