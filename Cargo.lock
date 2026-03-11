@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "Polora"
+name = "Penora"
 version = "0.1.0"
 dependencies = [
  "anyhow",
