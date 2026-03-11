@@ -1,3 +1,36 @@
+# Notes
+```
+User does something
+        ↓
+InputHandler intercepts it
+        ↓
+Document Model gets updated
+        ↓
+Renderer reads Document, writes to TextBuffer
+        ↓
+GTK draws the screen
+```
+data flows one way only. we never read back from the buffer, ever.
+
+bullet characters and numbers are never stored in text, the renderer generates them from the paragraph kind at display time so list numbering just works automatically.
+
+anchors like images and checkboxes have a stable UUID so when undo destroys GTKs internal anchor we just look it up and recreate it, no more positional guessing.
+
+
+use set_size_points not set_scale or you get weird line artifacts at tag boundaries.
+
+undo is two stacks we own completely, GTKs built in undo is disabled.
+
+Document is 
+
+```Document
+  └── Vec<Paragraph>
+        ├── kind: what type of block is this
+        ├── text: the raw plain text, no symbols
+        └── marks: formatting ranges on that text
+```
+will improve usoing ropey later
+
 # Penora
 
 Penora is a simple WYSIWYG editor for note taking written in Rust and GTK 4. It uses Markdown as storage format and can read simple Markdown files. However, the main focus of Marko Editor is WYSIWYG note taking and not being a 100% compliant Markdown editor.
